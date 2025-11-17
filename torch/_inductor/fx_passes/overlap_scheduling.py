@@ -267,18 +267,27 @@ class OverlapScheduler:
         self.collective_info: dict[fx.Node, CollectiveInfo] = {}
         self.unscheduled_collectives: OrderedSet[fx.Node] = OrderedSet()
 
+        # Identify compute nodes early (needed for baseline memory computation)
+        self.compute_nodes = [n for n in self.nodes if is_compute_node(n)]
+        self.current_compute_index = 0
+
         # Memory tracking using abstracted MemoryTracker
-        self.original_peak_memory = max(
-            build_memory_profile(self.graph, _is_releasable)
-        )
+        mem_profile = build_memory_profile(self.graph, _is_releasable)
+        self.original_peak_memory = max(mem_profile)
+
+        # Compute baseline memory before each compute node in original schedule
+        self.original_mem_before_compute_index: list[int] = []
+        self._init_baseline_memory_by_compute(mem_profile)
+
+        # How much we allow ourselves to go above baseline (configurable)
+        self.max_memory_increase_bytes = gb_to_bytes(1.0)
+
         self.memory_tracker = MemoryTracker(self.graph)
 
         self.wait_to_start: dict[fx.Node, fx.Node] = {}
         self._identify_collectives()
 
         self.compute_index_domination = self._calculate_compute_node_domination_index()
-        self.compute_nodes = [n for n in self.nodes if is_compute_node(n)]
-        self.current_compute_index = 0
 
         # Scheduling state
         self.potentially_hidden_collectives = (
@@ -306,6 +315,63 @@ class OverlapScheduler:
                 ancestors[node] |= ancestors[input_node]
 
         return ancestors
+
+    def _init_baseline_memory_by_compute(self, mem_profile: list[int]) -> None:
+        """
+        Populate self.original_mem_before_compute_index so that for the kth compute
+        node in self.compute_nodes, self.original_mem_before_compute_index[k] is
+        the memory just *before* that compute node in the original schedule.
+        """
+        self.original_mem_before_compute_index = []
+        if not self.compute_nodes:
+            return
+
+        compute_iter = iter(self.compute_nodes)
+        next_compute = next(compute_iter, None)
+        curr_mem_before = 0
+
+        for node, mem_after in zip(self.nodes, mem_profile):
+            if node is next_compute:
+                self.original_mem_before_compute_index.append(curr_mem_before)
+                next_compute = next(compute_iter, None)
+            curr_mem_before = mem_after
+
+        # Sanity check: we should have an entry per compute node
+        assert len(self.original_mem_before_compute_index) == len(self.compute_nodes)
+
+    def _current_extra_memory_vs_baseline(self) -> int:
+        """
+        How much extra memory we currently have relative to the original schedule
+        at the "position" of the current compute index.
+
+        We call this before scheduling compute_nodes[self.current_compute_index].
+        """
+        if not self.compute_nodes:
+            baseline = 0
+        elif self.current_compute_index < len(self.original_mem_before_compute_index):
+            baseline = self.original_mem_before_compute_index[
+                self.current_compute_index
+            ]
+        else:
+            # After last compute, just compare against original peak.
+            baseline = self.original_peak_memory
+
+        return self.memory_tracker.current_memory_bytes - baseline
+
+    def _prefetch_would_exceed_memory_budget(self, info: CollectiveInfo) -> bool:
+        """
+        Check if starting this collective *now* would push us too far above
+        the baseline memory for the current compute position.
+
+        This is intentionally approximate: we treat the "extra" footprint as
+        the size of the in-flight collective buffer.
+        """
+        extra_now = self._current_extra_memory_vs_baseline()
+
+        # Project extra memory if we raise this start here.
+        projected_extra = extra_now + info.size_bytes
+
+        return projected_extra > self.max_memory_increase_bytes
 
     def off_compute_path(self, n: fx.Node) -> bool:
         """Check if a node is off the compute path (doesn't block any compute)."""
@@ -530,9 +596,14 @@ class OverlapScheduler:
         """Check if we need to force a wait due to memory pressure"""
         if not self.in_flight:
             return False
-        return self.in_flight_bytes >= self.max_in_flight_bytes or (
+
+        if self.in_flight_bytes >= self.max_in_flight_bytes:
+            return True
+
+        # Check if we're too far above original peak memory (global constraint for sunk waits)
+        return (
             self.memory_tracker.current_memory_bytes - self.original_peak_memory
-        ) > gb_to_bytes(1.0)
+        ) > self.max_memory_increase_bytes
 
     def _force_oldest_wait(self) -> None:
         """Schedule the oldest in flight wait"""
@@ -610,23 +681,18 @@ class OverlapScheduler:
         """Opportunistically schedule collectives that can be hidden by compute."""
         compute_ancestors = self.node_ancestors[compute_node]
 
-        # Filter collectives by distance and compute index domination
+        # Filter collectives by distance (compile-time / search bound)
         possible_collectives = []
         for collective in self.unscheduled_collectives:
             distance = abs(self.node_idx[compute_node] - self.node_idx[collective])
             if distance > self.max_node_distance:
                 break
 
-            # Skip collectives that are too far ahead in compute index, but allow scheduling
-            # collectives which are off compute path (which typically release memory)
-            # TODO: we could potentially be more strict about limiting the amount of
-            # pre-fetched memory before memory peak, and adjust allowed collective mem.
-            if not self.off_compute_path(collective):
-                if (
-                    self.compute_index_domination[collective]
-                    - self.current_compute_index
-                ) > self.max_compute_pre_fetch:
-                    continue
+            info = self.collective_info[collective]
+
+            # NEW: memory-based gating instead of compute-distance based gating
+            if self._prefetch_would_exceed_memory_budget(info):
+                continue
 
             possible_collectives.append(collective)
 
@@ -636,11 +702,12 @@ class OverlapScheduler:
         )
 
         log.debug(
-            "Scheduling collectives for overlap: compute_node=%s, available_time=%.2f ms, candidates=%d, current_memory=%d bytes",
+            "Scheduling collectives for overlap: compute_node=%s, available_time=%.2f ms, candidates=%d, current_memory=%d bytes, extra_vs_baseline=%d",
             compute_node.name,
             available_compute_time,
             len(possible_collectives),
             self.memory_tracker.current_memory_bytes,
+            self._current_extra_memory_vs_baseline(),
         )
 
         for collective in possible_collectives:
