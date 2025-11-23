@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional, TYPE_CHECKING, Union
 import torch
 import torch._inductor.custom_graph_pass
 from torch._environment import is_fbcode
-from torch.utils._config_module import Config, get_tristate_env, p
+from torch.utils._config_module import Config, get_tristate_env, install_config_module
 
 
 if TYPE_CHECKING:
