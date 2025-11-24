@@ -133,7 +133,7 @@ def validate_match(match: Match) -> bool:
         return False
 
     # Only use if index_size is small enough and estimated contention is relevant
-    if not (index_size < (min_index_size * 4) and contention_ratio < 4):
+    if not (index_size < (min_index_size * 8) and contention_ratio < 4):
         return False
     
     # Get optimal partitions and adjust for memory constraints
