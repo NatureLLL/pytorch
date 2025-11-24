@@ -37,6 +37,12 @@ from torch.utils import _pytree as pytree
 from torch.utils._pytree import tree_map
 
 
+_linear_cross_entropy_naive = cast(
+    Callable[..., Tensor],
+    getattr(F, "_linear_cross_entropy_naive"),  # noqa: B009
+)
+
+
 DispatchKey = torch._C.DispatchKey  # type: ignore[attr-defined]
 
 
@@ -682,7 +688,7 @@ def linear_cross_entropy(
             else "none"
         )
 
-        return F._linear_cross_entropy_naive(  # type: ignore[attr-defined]
+        return _linear_cross_entropy_naive(
             input,
             linear_weight,
             target,
@@ -733,7 +739,7 @@ def linear_cross_entropy_backward(
             else "none"
         )
 
-        ref = F._linear_cross_entropy_naive(  # type: ignore[attr-defined]
+        ref = _linear_cross_entropy_naive(
             input,
             linear_weight,
             target,
@@ -825,7 +831,7 @@ if hasattr(aten, "_linear_cross_entropy_vocab_chunking"):
         label_smoothing: float = 0.0,
         chunk_size: int = 4096,
     ) -> tuple[Tensor, Tensor]:
-        loss = F._linear_cross_entropy_naive(
+        loss = _linear_cross_entropy_naive(
             input,
             linear_weight,
             target,
@@ -854,8 +860,8 @@ if hasattr(aten, "_linear_cross_entropy_batch_chunking"):
         ignore_index: int = -100,
         label_smoothing: float = 0.0,
         chunk_size: int = 1024,
-    ) -> tuple[Tensor, tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]:
-        loss = F._linear_cross_entropy_naive(
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        loss = _linear_cross_entropy_naive(
             input,
             linear_weight,
             target,
